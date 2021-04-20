@@ -9,6 +9,11 @@ library("dynlm")
 library("seastests")
 library("forecast")
 library("TSA")
+library("epiR")
+library("extraDistr")
+library("MonoInc")
+library("pksensi")
+library("sensitivity")
 
 pop <- read.csv("C:/Users/tresc/Desktop/AMR-Model/Population data for ARIMA/Vietnam Population.csv")
 pop <- ts(pop$Population, start = 1960, frequency = 1)#
@@ -90,7 +95,7 @@ plot(portion_working)
 #population and working population from WB projections
 
 ##working population
-wb_working_pop <- read.csv("C:/Users/tresc/Desktop/AMR-Model/Population data for ARIMAViet Nam Working Population WB.csv")
+wb_working_pop <- read.csv("C:/Users/tresc/Desktop/AMR-Model/Population data for ARIMA/Viet Nam Working Population WB.csv")
 
 wb_working_pop <- ts(wb_working_pop$Working.Population, start = 1960, frequency = 1)
 
@@ -124,7 +129,7 @@ working_population ## this one for working population
 working_population[3]
 
 ##total population
-wb_pop <- read.csv("C:/Users/tresc/Desktop/AMR-Model/Population data for ARIMAViet Nam Population WB.csv")
+wb_pop <- read.csv("C:/Users/tresc/Desktop/AMR-Model/Population data for ARIMA/Viet Nam Population WB.csv")
 
 wb_pop <- ts(wb_pop$Population, start = 1960, frequency = 1)
 
@@ -162,8 +167,9 @@ wb_population[3]
 
 ###### defined parameters across the sectors ######
 n.t <- 47 ## time horizon - 46 years + cycle 0 (initial states)
-dr <- 0.035 ## discount rate
+dr <- 0.08 ## discount rate
 wtp <- 2000 ## willingness to pay per QALY gained
+scenario <- "HCA"
 
 ############# model functions
 inputs <- read.csv("C:/Users/tresc/Desktop/AMR-Model/input_V.csv")
@@ -198,9 +204,15 @@ model <- function(inputs){
   
   
   ###################*****HUMAN MODEL*****###########################
+  #for HCA and FCA, we only care about the losses in productivity, so we set the 
+  #reward for 'well' to be zero. Going into the 'dead' state incurs a productivity
+  #loss equal to the discounted value of future earnings, going into the 'res' or 'sus
+  #states incurs a loss equal to the earnings that would have been made during the 
+  #time in hospital. After 1 period, all people in 'dead' go to 'afterlife', which
+  #has a reward of zero
   
-  state_names <- c("well", "res","sus","dead") ## the compartments
-  transition_names  <- c("birth","r","s","mort_r", "mort_s","mort_w", "rec_r","rec_s")  ## the transition probabilities
+  state_names <- c("well", "res","sus","dead", "afterlife") ## the compartments
+  transition_names  <- c("birth","r","s","mort_r", "mort_s","mort_w", "rec_r","rec_s", "dead_aft")  ## the transition probabilities
   parameter_names <- c(state_names, transition_names)
   
   ## initial state vector (population starting in well)
@@ -220,6 +232,7 @@ model <- function(inputs){
   m_param[ , "rec_s"] <- rep(1-(m_param[1,"mort_s"]), n.t)
   m_param[ , "birth"] <- birthrate[1:n.t] ##set to be predicted net births
   m_param[ , "mort_w"] <- rep(0, n.t) ##set to zero because background mortality is included in net births
+  m_param[ , "dead_aft"] <- rep(1, n.t) #all those who die go to the afterlife
   
   m_param[1, 1:length(state_names)] <- state_i ## adding initial cycle 0 values
   
@@ -241,6 +254,8 @@ model <- function(inputs){
         (m_param[i-1,"mort_w"]*m_param[i-1,"well"])
       ## note that this is the incidence of death due to how we then multiply with QALY loss but 
       # if change that should also add in + m_param[i-1,"dead"] 
+      
+      m_param[i, "afterlife"] <- m_param[i-1, "afterlife"] + m_param[i-1, "dead"] #just keeps growing
     }
     return(m_param)
   }
@@ -255,7 +270,7 @@ model <- function(inputs){
   c_r <- human[parameter=="r_cost",value]
   c_s <- human[parameter=="s_cost",value]
   
-  cost_i <- c(0,c_r,c_s,0)
+  cost_i <- c(0,c_r,c_s,0, 0)
   
   ## start at cycle 1 so you do not multiply initial state vector 
   m_cost[2, 1:length(state_names)] <- cost_i
@@ -271,15 +286,20 @@ model <- function(inputs){
   colnames(m_rwd) <- parameter_names
   rownames(m_rwd) <- paste("cycle", 0:(n.t-1), sep  =  "")
   
+  pv_fut_life <- c(rep(0,46)) #expected remaining life years
+  for (i in 1:46){
+    pv_fut_life[i] <- human[parameter=="background_qol",value] * (1-dr)^(i-1)
+  }
+  pv_life <- sum(pv_fut_life)
   
-  r_s <- human[parameter=="hrqol_ill",value] ## disability weight of being in hospital with BSI
-  r_r <- human[parameter=="hrqol_res",value] ## same but adjusted for longer LoS
-  r_d <- human[parameter=="hrqol_death",value] 
+  r_s <- human[parameter=="background_qol",value]*(human[parameter=="hrqol_ill",value]-1) ## QoL lost from time in hospital
+  r_r <- human[parameter=="background_qol",value]*(human[parameter=="hrqol_res",value]-1) ## same but adjusted for longer LoS
+  r_d <- -1 * pv_life #discounted QoL loss from death
   
-  rwd_i <- c(1,r_r,r_s,r_d) 
+  rwd_i <- c(0,r_r,r_s,r_d, 0) 
   
   ##############################################################################
-  #have changed health state rewards to be 1, 0.98 0.975, 0 
+  #have changed health state rewards to be 1, 0.98 0.975, 0, 0 
   ##############################################################################
   
   ## start at cycle 1 so you do not multiply initial state vector 
@@ -293,8 +313,12 @@ model <- function(inputs){
   }
   
   #### Productivity Costs ###########
-  #all zero at present since we are just counting the benefit of hours worked - the effective productivity 'cost'
-  #will actually be the difference in rewards
+  #for HCA and FCA, we only care about the losses in productivity, so we set the 
+  #reward for 'well' to be zero. Going into the 'dead' state incurs a productivity
+  #loss equal to the discounted value of future earnings, going into the 'res' or 'sus
+  #states incurs a loss equal to the earnings that would have been made during the 
+  #time in hospital. After 1 period, all people in 'dead' go to 'afterlife', which
+  #has a reward of zero
   
   m_cost_prod <- matrix(rep(0),nrow = n.t, ncol = length(parameter_names))
   colnames(m_cost_prod) <- parameter_names
@@ -303,7 +327,7 @@ model <- function(inputs){
   c_r_prod <- 0
   c_s_prod <- 0
   
-  cost_i_prod <- c(0,0,0,0)
+  cost_i_prod <- rep(0,(length(state_names)))
   
   ## start at cycle 1 so you do not multiply initial state vector
   m_cost_prod[2,1:length(state_names)] <- cost_i_prod
@@ -317,20 +341,39 @@ model <- function(inputs){
   
   #### Productivity Rewards #########
   
+  #calculate the discounted value of future work
+  #
+  
   m_rwd_prod <- matrix(rep(0), nrow = n.t, ncol = length(parameter_names))
   colnames(m_rwd_prod) <- parameter_names
   rownames(m_rwd_prod) <- paste("cycle", 0:(n.t-1), sep = "")
   
-  r_r_prod <- human[parameter=="prod",value]*0.923504449 #accounting for longer stay if res
+  r_r_prod <- -1*(human[parameter=="prod",value]+human[parameter=="unpaid_prod",value])*(1-0.923504449) #accounting for longer stay if res
   
-  r_s_prod <- human[parameter=="prod",value]*0.94
+  r_s_prod <- -1*(human[parameter=="prod",value]+human[parameter=="unpaid_prod",value])*(1-0.94)
   
-  r_d_prod <- 0
+  r_w_prod <- 0
   
-  r_w_prod <- human[parameter=="prod",value]
+  r_aft_prod <- 0
+  
+  yearly_prod <- (human[parameter=="prod",value] + human[parameter=="unpaid_prod", value])
+  pv_fut_prod <- c(rep(0,34)) #expected remaining working years
+  for (i in 1:34){
+    pv_fut_prod[i] <- yearly_prod * (1-dr)^(i-1)
+  }
+  pv_life_prod <- sum(pv_fut_prod)
+  
+  if(scenario == "HCA"){
+    r_d_prod <- -1 * pv_life_prod
+  } else if(scenario == "FCA"){
+    r_d_prod <- -0.5 * yearly_prod
+  } else{
+    paste("ERROR: PLEASE CHOOSE AN APPROACH TO ESTIMATING PRODUCTIVITY OUTCOMES")
+  }
+  
   
   #multiply the initial productivity rewards by the portion of people who are working
-  rwd_i_prod <- c(portion_working[1]*r_w_prod, portion_working[1]*r_r_prod, portion_working[1]*r_s_prod, portion_working[1]*r_d_prod)
+  rwd_i_prod <- c(portion_working[1]*r_w_prod, portion_working[1]*r_r_prod, portion_working[1]*r_s_prod, portion_working[1]*r_d_prod, r_aft_prod)
   
   ## start at cycle 1 so you do not multiply initial state vector
   m_rwd_prod[2,1:length(state_names)] <- rwd_i_prod 
@@ -345,7 +388,8 @@ model <- function(inputs){
     }
   }
   
-  #now we multiply the productivity rewards across all states and time steps by the portion of people working
+  #now we multiply the productivity rewards across all states and time steps
+  #(apart from initial, which we already did) by the portion of people working
   for (j in 1:length(state_names)) {
     for (i in 3:(n.t)) {
       m_rwd_prod[i,j] <- m_rwd_prod[i,j]*portion_working[i]
@@ -558,8 +602,8 @@ model <- function(inputs){
   
   total_results_prod[1,2] <- results_base_h[,2]
   total_results_prod[2,2] <- results_interv_h[,2]
-  total_results_prod[1,1] <- results_base_prod[,2]
-  total_results_prod[2,1] <- results_interv_prod[,2]
+  total_results_prod[1,1] <- results_base_prod[,2]   #will be negative
+  total_results_prod[2,1] <- results_interv_prod[,2] #will be negative but hopefully closer to zero
   
   #### HC 
   incr_cost <- (results_interv_h[1,1] - results_base_h[1,1])
@@ -567,19 +611,16 @@ model <- function(inputs){
   icer <- incr_cost/incr_benefit
   NMB_H <- (incr_benefit*wtp)-(incr_cost)  # per person in the population
   
-  
-  
   #############################################################################
   #because there technically aren't any costs for the productivity side,
   #we use the negative productivity gain from base to intervention (a productivity gain would incur a negative 'cost')
   #############################################################################
   
-  
   ### Productivity
-  incr_cost_prod <- total_results_prod[1,1] - total_results_prod[2,1]
-  incr_benefit_prod <- total_results_prod[2,2] - total_results_prod[1,2]
-  icer_prod <- incr_cost_prod/incr_benefit_prod
-  NMB_prod <- total_results_prod[2,1] - total_results_prod[1,1]
+  incr_cost_prod <- total_results_prod[1,1] - total_results_prod[2,1] #hopefully negative
+  incr_benefit_prod <- total_results_prod[2,2] - total_results_prod[1,2] #hopefully positive
+  icer_prod <- incr_cost_prod/incr_benefit_prod #hopefully negative, if intervention improves productivity and saves QALYs
+  NMB_prod <- total_results_prod[2,1] - total_results_prod[1,1] #hopefully positive
   
   ## Farm level
   incr_cost_a <- (results_interv_a[1,1] - results_base_a[1,1])
@@ -876,3 +917,206 @@ ggplot(tornado, aes(variable, ymin = min, ymax = max)) +
   geom_hline(yintercept = 0, linetype = "dotted") +
   theme_bw() +
   theme(axis.text = element_text(size = 15))
+
+################################################################################
+############################exploring discount rates############################
+################################################################################
+model(inputs)
+dr <- 0.094
+model(inputs) #becomes significantly less cost-effective with a higher discount rate
+dr <- 0.035
+
+dr_vector <- as.vector(seq(from = 0, to = 0.12, by = 0.0001))
+dr_icer <- as.vector(rep(0,1201))
+
+for(i in 1:1201){
+  dr <- dr_vector[i]
+  dr_icer[i] <- as.data.frame(model(inputs))[1,13]
+}
+
+dr_df <- as.data.frame(cbind(dr_vector, dr_icer))
+colnames(dr_df) <- c("Discount Rate", "Macro-Level ICER")
+
+plot(dr_df$`Discount Rate`, dr_df$`Macro-Level ICER`)
+
+ggplot(dr_df, aes(x=dr_vector, y=dr_icer)) +
+  geom_point()+
+  geom_vline(xintercept = 0.03, linetype = "dotted")+
+  geom_vline(xintercept = 0.066, lty = "dashed")+
+  geom_vline(xintercept = 0.094)+
+  ggtitle("Macro-Level ICER at Different Levels of the Discount Rate")+
+  labs(title = "Macro-Level ICER at Different Levels of the Discount Rate", x = "Intertemporal Discount Rate", y = "Macro-Level ICER")
+
+################################################################################
+############################exploring farm costs################################
+################################################################################
+
+cost_vector <- as.vector(seq(from = -0.05, to = 0.15, by = 0.0001))
+cost_icer <- as.vector(rep(0,2001))
+
+inputs_cost <- inputs 
+
+for(i in 1:1201){
+  inputs_cost[24,4] <- cost_vector[i]
+  cost_icer[i] <- as.data.frame(model(inputs_cost))[1,13]
+  inputs_cost <- inputs 
+}
+
+cost_df <- as.data.frame(cbind(cost_vector, cost_icer))
+colnames(cost_df) <- c("Cost per Chicken", "Macro-Level ICER")
+
+plot(cost_df$`Cost per Chicken`, cost_df$`Macro-Level ICER`)
+
+ggplot(cost_df, aes(x=cost_vector, y=cost_icer)) +
+  geom_point()+
+  geom_vline(xintercept = 0, linetype = "dashed", lwd = 1, col = "red")+
+  #geom_vline(xintercept = 0.02173, linetype = "dashed", lwd = 1, col = "blue")+
+  geom_vline(xintercept = 0.022205, linetype = "dashed", lwd = 1, col = "blue")+
+  labs(title = "Macro-Level ICER at Different Levels of Intervention Cost", 
+       x = "Intervention Cost per Chicken", y = "Macro-Level ICER", 
+       subtitle = "Red: ICER at Zero Net Cost, Blue: ICER at Cost-Effective Threshold (0.022205 USD)")
+
+################################################################################
+################################################################################
+
+#Partial Rank Correlation Coefficient
+#parameters to vary: same as in CEAC, but now add discount rate
+prcc_df <- data.table()
+
+prcc_df$a_mort <- rep(0,10000)
+prcc_df$a_inc <- rep(0,10000)
+prcc_df$prod_growth <- rep(0,10000)
+prcc_df$a_res_cost <- rep(0,10000)
+prcc_df$a_int_cost <- rep(0,10000)
+prcc_df$h_res_mort <- rep(0,10000)
+prcc_df$h_sus_mort <- rep(0,10000)
+prcc_df$a_res_prob <- rep(0,10000)
+prcc_df$a_sus_prob <- rep(0,10000)
+prcc_df$a_res_mort <- rep(0,10000)
+prcc_df$a_sus_mort <- rep(0,10000)
+prcc_df$h_amr_fall <- rep(0,10000)
+prcc_df$a_amr_fall <- rep(0,10000)
+prcc_df$dr <- rep(0,10000)
+prcc_df$ICER <- rep(0,10000)
+
+inputs_prcc <- inputs
+
+set.seed(42069)
+
+for(i in 1:10000){
+  inputs_prcc[13,4] <- rnorm(1,as.numeric(inputs_prcc[13,4]),as.numeric((inputs_prcc[13,4] - inputs_prcc[13,6])/1.96)) #animal on-farm mortality
+  inputs_prcc[18,4] <- rnorm(1,as.numeric(inputs_prcc[18,4]),as.numeric((inputs_prcc[18,4] - inputs_prcc[18,6])/1.96)) #income per animal
+  inputs_prcc[33,4] <- rnorm(1,as.numeric(inputs_prcc[33,4]),as.numeric((inputs_prcc[33,4] - inputs_prcc[33,6])/1.96)) #productivity growth
+  
+  #random draws of uniformly distributed variables
+  inputs_prcc[22,4] <- runif(1,as.numeric(inputs_prcc[22,6]),as.numeric(inputs_prcc[22,7])) #cost of treating a resistant infection in animals
+  inputs_prcc[24,4] <- runif(1,as.numeric(inputs_prcc[24,6]),as.numeric(inputs_prcc[24,7])) #intervention cost per animal
+  
+  #random draws of the beta-distributed variables
+  inputs_prcc[5,4] <- rbeta(1,as.numeric(inputs_prcc[5,6]),as.numeric(inputs_prcc[5,7])) #human mortality from resistant infection
+  inputs_prcc[6,4] <- rbeta(1,as.numeric(inputs_prcc[6,6]),as.numeric(inputs_prcc[6,7])) #human mortality from susceptible infection
+  inputs_prcc[15,4] <- rbeta(1,as.numeric(inputs_prcc[15,6]),as.numeric(inputs_prcc[15,7])) #animal probability of resistant infection
+  inputs_prcc[16,4] <- rbeta(1,as.numeric(inputs_prcc[16,6]),as.numeric(inputs_prcc[16,7])) #animal probability of susceptible infection
+  inputs_prcc[19,4] <- rbeta(1,as.numeric(inputs_prcc[19,6]),as.numeric(inputs_prcc[19,7])) #animal mortality from susceptible infection
+  inputs_prcc[20,4] <- rbeta(1,as.numeric(inputs_prcc[20,6]),as.numeric(inputs_prcc[20,7])) #animal mortality from resistant infection
+  inputs_prcc[25,4] <- rbeta(1,as.numeric(inputs_prcc[25,6]),as.numeric(inputs_prcc[25,7])) #intervention reduction in human AMR
+  inputs_prcc[26,4] <- rbeta(1,as.numeric(inputs_prcc[26,6]),as.numeric(inputs_prcc[26,7])) #intervention reduction in animal AMR
+  
+  #randonly draw the discount rate
+  dr <- rtriang(1, a = 0, b = 10, c = 8)
+
+  prcc_df$a_mort[i] <- inputs_prcc[13,4]
+  prcc_df$a_inc[i] <- inputs_prcc[18,4]
+  prcc_df$prod_growth[i] <- inputs_prcc[33,4]
+  prcc_df$a_res_cost[i] <- inputs_prcc[22,4]
+  prcc_df$a_int_cost[i] <- inputs_prcc[24,4]
+  prcc_df$h_res_mort[i] <- inputs_prcc[5,4]
+  prcc_df$h_sus_mort[i] <- inputs_prcc[6,4]
+  prcc_df$a_res_prob[i] <- inputs_prcc[15,4]
+  prcc_df$a_sus_prob[i] <- inputs_prcc[16,4]
+  prcc_df$a_res_mort[i] <- inputs_prcc[19,4]
+  prcc_df$a_sus_mort[i] <- inputs_prcc[20,4]
+  prcc_df$h_amr_fall[i] <- inputs_prcc[25,4]
+  prcc_df$a_amr_fall[i] <- inputs_prcc[26,4]
+  prcc_df$dr[i] <- dr 
+  prcc_df$ICER[i] <- model(inputs_prcc)[1,13]
+  
+  inputs_prcc <- inputs
+  
+  if(i %% 100 == 0){
+    print(i)
+  }
+  
+}
+
+safe <- prcc_df
+
+a_mort <- as.numeric(unlist(safe$a_mort))
+a_inc <- as.numeric(unlist(safe$a_inc))
+prod_growth <- as.numeric(unlist(safe$prod_growth))
+a_res_cost <- as.numeric(unlist(safe$a_res_cost))
+a_int_cost <- as.numeric(unlist(safe$a_int_cost))
+h_res_mort <- as.numeric(unlist(safe$h_res_mort))
+h_sus_mort <- as.numeric(unlist(safe$h_sus_mort))
+a_res_prob <- as.numeric(unlist(safe$a_res_prob))
+a_sus_prob <- as.numeric(unlist(safe$a_sus_prob))
+a_res_mort <- as.numeric(unlist(safe$a_res_mort))
+a_sus_mort <- as.numeric(unlist(safe$a_sus_mort))
+h_amr_fall <- as.numeric(unlist(safe$h_amr_fall))
+a_amr_fall <- as.numeric(unlist(safe$a_amr_fall))
+drr <- as.numeric(unlist(safe$dr))
+ICER <- as.numeric(unlist(safe$ICER))
+
+prcc_dataset <- as.data.frame(cbind(a_mort,a_inc,prod_growth,a_res_cost,a_int_cost,h_res_mort,h_sus_mort,a_res_prob,a_sus_prob,a_res_mort,a_sus_mort,h_amr_fall,a_amr_fall,drr,ICER))
+
+write.csv(prcc_dataset,"C:/Users/tresc/Desktop/AMR-Model/outputs/prcc_data.csv", row.names = F)
+
+#evaluate the monotonicity of the relationships by looking at scatterplots
+
+plot(prcc_dataset$a_mort , prcc_dataset$ICER) #safe
+
+plot(prcc_dataset$a_inc, prcc_dataset$ICER) #safe
+
+plot(prcc_dataset$prod_growth , prcc_dataset$ICER) #safe
+
+plot(prcc_dataset$a_res_cost , prcc_dataset$ICER) #safe
+
+plot(prcc_dataset$a_int_cost , prcc_dataset$ICER) #safe
+
+plot(prcc_dataset$h_res_mort , prcc_dataset$ICER) #possible non-monotonicity
+
+plot(prcc_dataset$h_sus_mort , prcc_dataset$ICER) #possible non-monotonicity
+
+plot(prcc_dataset$a_res_prob , prcc_dataset$ICER) #possible non-monotonicity
+
+plot(prcc_dataset$a_sus_prob , prcc_dataset$ICER) #safe
+
+plot(prcc_dataset$a_res_mort , prcc_dataset$ICER) #safe
+
+plot(prcc_dataset$a_sus_mort , prcc_dataset$ICER) #safe
+
+plot(prcc_dataset$h_amr_fall , prcc_dataset$ICER) #unclear
+
+plot(prcc_dataset$a_amr_fall , prcc_dataset$ICER) #unclear
+
+plot(prcc_dataset$drr , prcc_dataset$ICER) #unclear
+
+id <- seq(from = 1, to = 10000, by = 1)
+
+monotonic_test_dataset <- as.data.frame(cbind(id, prcc_dataset))
+
+#gauge to PRCC
+
+epi.prcc(prcc_dataset, sided.test = 2, conf.level = 0.95)
+#significant values: 5 (animal intervention cost)(+), 7 (human mortality from sus)(-), 8 (animal probability of res)(-), 
+#11 (animal mortality from sus)(-), 12 (fall in human AMR)(-), 13 (fall in animal AMR)(-), 14 (discount rate)(-)
+#some of these don't make sense though --> we saw that a higher discount rate increased the ICER
+#this is probably because PRCC requires a monotonic relationship
+
+epi.prcc(prcc_dataset, sided.test = 1, conf.level = 0.95)
+#in the one-sided test, the significant values are:
+#2(-), 5(+), 7(-), 8(-), 11(-), 12(-), 13(-), 14(-)
+#only difference is that income from animal sale is now significant, and negatively related to ICER (makes sense)
+
+
+   
